@@ -1,88 +1,40 @@
-// rijndael.cpp - modified by Chris Morgan <cmorgan@wpi.edu>
-// and Wei Dai from Paulo Baretto's Rijndael implementation
-// The original code and all modifications are in the public domain.
-
-// use "cl /EP /P /DCRYPTOPP_GENERATE_X64_MASM rijndael.cpp" to generate MASM code
-
 /*
 July 2018: Added support for ARMv7 AES instructions via Cryptogams ASM.
            See the head notes in aes_armv4.S for copyright and license.
+这里引入了 ARMv7 的 AES 汇编优化（不是 intrinsic，是纯汇编）。
+文件 aes_armv4.S 是 ARM 汇编源文件。
 */
-
 /*
 September 2017: Added support for Power8 AES instructions via compiler intrinsics.
+使用 编译器内置函数（intrinsics） 实现 AES 加速。
 */
-
 /*
 July 2017: Added support for ARMv8 AES instructions via compiler intrinsics.
 */
-
 /*
 July 2010: Added support for AES-NI instructions via compiler intrinsics.
 */
-
 /*
-Feb 2009: The x86/x64 assembly code was rewritten in by Wei Dai to do counter mode
-caching, which was invented by Hongjun Wu and popularized by Daniel J. Bernstein
-and Peter Schwabe in their paper "New AES software speed records". The round
-function was also modified to include a trick similar to one in Brian Gladman's
-x86 assembly code, doing an 8-bit register move to minimize the number of
-register spills. Also switched to compressed tables and copying round keys to
-the stack.
-
-The C++ implementation uses compressed tables if
-CRYPTOPP_ALLOW_RIJNDAEL_UNALIGNED_DATA_ACCESS is defined.
-It is defined on x86 platforms by default but no others.
+Feb 2009: The x86/x64 assembly code was rewritten...
+- 引入了 counter mode caching（CTR 模式优化）。
+- 灵感来自 Daniel J. Bernstein 的论文《New AES software speed records》。
+- 使用了 压缩表（compressed tables） 和 寄存器分配优化。
+- 8-bit 寄存器移动技巧减少寄存器溢出（spill）。
 */
-
 /*
-July 2006: Defense against timing attacks was added in by Wei Dai.
-
-The code now uses smaller tables in the first and last rounds,
-and preloads them into L1 cache before usage (by loading at least
-one element in each cache line).
-
-We try to delay subsequent accesses to each table (used in the first
-and last rounds) until all of the table has been preloaded. Hopefully
-the compiler isn't smart enough to optimize that code away.
-
-After preloading the table, we also try not to access any memory location
-other than the table and the stack, in order to prevent table entries from
-being unloaded from L1 cache, until that round is finished.
-(Some popular CPUs have 2-way associative caches.)
+July 2006: Defense against timing attacks was added...
+使用 小表（仅第一轮和最后一轮）
+预加载表到 L1 缓存（避免 cache miss）
+避免内存访问（防止表被换出缓存）
+延迟访问（防止编译器优化掉预加载）
 */
-
-// This is the original introductory comment:
-
-/**
- * version 3.0 (December 2000)
- *
- * Optimised ANSI C code for the Rijndael cipher (now AES)
- *
- * author Vincent Rijmen <vincent.rijmen@esat.kuleuven.ac.be>
- * author Antoon Bosselaers <antoon.bosselaers@esat.kuleuven.ac.be>
- * author Paulo Barreto <paulo.barreto@terra.com.br>
- *
- * This code is hereby placed in the public domain.
- *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ''AS IS'' AND ANY EXPRESS
- * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHORS OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
- * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
- * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
 
 #include "pch.h"
 #include "config.h"
 
 #ifndef CRYPTOPP_IMPORTS
 #ifndef CRYPTOPP_GENERATE_X64_MASM
+//宏 CRYPTOPP_GENERATE_X64_MASM 会触发汇编代码生成模式,x64 汇编代码（MASM 格式）。。
 
 #include "rijndael.h"
 #include "misc.h"
@@ -90,6 +42,10 @@ being unloaded from L1 cache, until that round is finished.
 
 // VS2017 and global optimization bug. Also see
 // https://github.com/weidai11/cryptopp/issues/649
+/*
+给 Visual Studio 2017（MSVC 15.0 ~ 15.9） 开的 编译器级“ workaround”——
+临时关掉全局优化，再只打开“代码大小”和“速度”优化，否则编译器会 错误地把 Rijndael 的关键代码优化掉，导致 运行时崩溃或结果错误。
+*/
 #if (CRYPTOPP_MSC_VERSION >= 1910) && (CRYPTOPP_MSC_VERSION <= 1916)
 # ifndef CRYPTOPP_DEBUG
 #  pragma optimize("", off)
@@ -100,27 +56,37 @@ being unloaded from L1 cache, until that round is finished.
 NAMESPACE_BEGIN(CryptoPP)
 
 // Hack for http://github.com/weidai11/cryptopp/issues/42 and http://github.com/weidai11/cryptopp/issues/132
+//宏定义：允许未对齐访问
 #if (CRYPTOPP_SSE2_ASM_AVAILABLE || defined(CRYPTOPP_X64_MASM_AVAILABLE))
 # define CRYPTOPP_ALLOW_RIJNDAEL_UNALIGNED_DATA_ACCESS 1
 #endif
 
 // Clang intrinsic casts
+//把任意指针（通常是 byte * 或 word32 *）安全地转成 __m128i *，以便后续使用 SSE/AVX intrinsics。
 #define M128I_CAST(x) ((__m128i *)(void *)(x))
 #define CONST_M128I_CAST(x) ((const __m128i *)(const void *)(x))
 
 #if defined(CRYPTOPP_ALLOW_RIJNDAEL_UNALIGNED_DATA_ACCESS)
+// 只有 “有汇编加速”且“未被禁用” ,最优分支：汇编版压缩表
 # if (CRYPTOPP_SSE2_ASM_AVAILABLE || defined(CRYPTOPP_X64_MASM_AVAILABLE)) && !defined(CRYPTOPP_DISABLE_RIJNDAEL_ASM)
 namespace rdtable {CRYPTOPP_ALIGN_DATA(16) word64 Te[256+2];}
 using namespace rdtable;
+//次优分支：纯 C++ 压缩表
 # else
 static word64 Te[256];
 # endif
+
 static word64 Td[256];
-#else // Not CRYPTOPP_ALLOW_RIJNDAEL_UNALIGNED_DATA_ACCESS
+
+#else 
+//在‘非压缩表’分支里，额外放一份‘哑’压缩表，只为满足 Microsoft x64 汇编文件对符号 Te 的链接需求；
+//真正的加解密仍用 4×256 的 word32 非压缩表。
+//CRYPTOPP_ALIGN_DATA(16),16 字节对齐是给 SIMD 指令用的
 # if defined(CRYPTOPP_X64_MASM_AVAILABLE)
 // Unused; avoids linker error on Microsoft X64 non-AESNI platforms
 namespace rdtable {CRYPTOPP_ALIGN_DATA(16) word64 Te[256+2];}
 # endif
+
 CRYPTOPP_ALIGN_DATA(16) static word32 Te[256*4];
 CRYPTOPP_ALIGN_DATA(16) static word32 Td[256*4];
 #endif // CRYPTOPP_ALLOW_RIJNDAEL_UNALIGNED_DATA_ACCESS
@@ -131,29 +97,7 @@ ANONYMOUS_NAMESPACE_BEGIN
 
 #if CRYPTOPP_BOOL_X64 || CRYPTOPP_BOOL_X32 || CRYPTOPP_BOOL_X86
 
-// Determine whether the range between begin and end overlaps
-//   with the same 4k block offsets as the Te table. Logically,
-//   the code is trying to create the condition:
-//
-// Two separate memory pages:
-//
-//  +-----+   +-----+
-//  |XXXXX|   |YYYYY|
-//  |XXXXX|   |YYYYY|
-//  |     |   |     |
-//  |     |   |     |
-//  +-----+   +-----+
-//  Te Table   Locals
-//
-// Have a logical cache view of (X and Y may be inverted):
-//
-// +-----+
-// |XXXXX|
-// |XXXXX|
-// |YYYYY|
-// |YYYYY|
-// +-----+
-//
+//检测局部变量是否与 Te 表落在同一 4 KB 页（防止 cache 冲突）
 static inline bool AliasedWithTable(const byte *begin, const byte *end)
 {
 	ptrdiff_t s0 = uintptr_t(begin)%4096, s1 = uintptr_t(end)%4096;
@@ -163,7 +107,7 @@ static inline bool AliasedWithTable(const byte *begin, const byte *end)
 	else
 		return (s0 < t1 || s1 <= t1) || (s0 >= t0 || s1 > t0);
 }
-
+//定义汇编函数用的参数包 Locals（寄存器+指针+步长）
 struct Locals
 {
 	word32 subkeys[4*12], workspace[8];
@@ -172,7 +116,7 @@ struct Locals
 	size_t inIncrement, inXorIncrement, outXorIncrement, outIncrement;
 	size_t regSpill, lengthAndCounterFlag, keysBegin;
 };
-
+//预留 4 KB + 256 B + sizeof(Locals) 的栈空间，让汇编代码安全运行
 const size_t s_aliasPageSize = 4096;
 const size_t s_aliasBlockSize = 256;
 const size_t s_sizeToAllocate = s_aliasPageSize + s_aliasBlockSize + sizeof(Locals);
@@ -182,13 +126,14 @@ const size_t s_sizeToAllocate = s_aliasPageSize + s_aliasBlockSize + sizeof(Loca
 ANONYMOUS_NAMESPACE_END
 
 // ************************* Portable Code ************************************
-
+//一次宏调用 就完成 SubBytes + ShiftRows + MixColumns 对 一列 4 字节 的全部作用
 #define QUARTER_ROUND(L, T, t, a, b, c, d)	\
 	a ^= L(T, 3, byte(t)); t >>= 8;\
 	b ^= L(T, 2, byte(t)); t >>= 8;\
 	c ^= L(T, 1, byte(t)); t >>= 8;\
 	d ^= L(T, 0, t);
 
+//小端最后一轮专用
 #define QUARTER_ROUND_LE(t, a, b, c, d)	\
 	tempBlock[a] = ((byte *)(Te+byte(t)))[1]; t >>= 8;\
 	tempBlock[b] = ((byte *)(Te+byte(t)))[1]; t >>= 8;\
@@ -196,6 +141,7 @@ ANONYMOUS_NAMESPACE_END
 	tempBlock[d] = ((byte *)(Te+t))[1];
 
 #if defined(CRYPTOPP_ALLOW_RIJNDAEL_UNALIGNED_DATA_ACCESS)
+//解密最后一轮
 	#define QUARTER_ROUND_LD(t, a, b, c, d)	\
 		tempBlock[a] = ((byte *)(Td+byte(t)))[GetNativeByteOrder()*7]; t >>= 8;\
 		tempBlock[b] = ((byte *)(Td+byte(t)))[GetNativeByteOrder()*7]; t >>= 8;\
@@ -209,9 +155,11 @@ ANONYMOUS_NAMESPACE_END
 		tempBlock[d] = Sd[t];
 #endif
 
+//加解密轮函数
 #define QUARTER_ROUND_E(t, a, b, c, d)		QUARTER_ROUND(TL_M, Te, t, a, b, c, d)
 #define QUARTER_ROUND_D(t, a, b, c, d)		QUARTER_ROUND(TL_M, Td, t, a, b, c, d)
 
+//加解密最后一轮
 #if (CRYPTOPP_LITTLE_ENDIAN)
 	#define QUARTER_ROUND_FE(t, a, b, c, d)		QUARTER_ROUND(TL_F, Te, t, d, c, b, a)
 	#define QUARTER_ROUND_FD(t, a, b, c, d)		QUARTER_ROUND(TL_F, Td, t, d, c, b, a)
@@ -245,6 +193,8 @@ ANONYMOUS_NAMESPACE_END
 #define fd(x)   (f8(x) ^ f4(x) ^ x)
 #define fe(x)   (f8(x) ^ f4(x) ^ f2(x))
 
+//告诉上层这次加密/解密到底需要多大的内存对齐，从而让调用者把缓冲区放到最合适的地址，
+//继承自 BlockTransformation
 unsigned int Rijndael::Base::OptimalDataAlignment() const
 {
 #if (CRYPTOPP_AESNI_AVAILABLE)
@@ -268,6 +218,9 @@ unsigned int Rijndael::Base::OptimalDataAlignment() const
 	return BlockTransformation::OptimalDataAlignment();
 }
 
+//FillEncTable 把 256 个 S-box 输出扩展成 4×GF(2⁸) 乘积，
+//压成 8 字节压缩表或摊平成 4×256 非压缩表，末尾填两个零哨兵供汇编安全越界，
+//最后置标志告诉全世界：Te 已就绪，可以零计算、零拷贝、零分支地加密了。
 void Rijndael::Base::FillEncTable()
 {
 	for (int i=0; i<256; i++)
@@ -368,6 +321,7 @@ void CRYPTOGAMS_decrypt(const byte *inBlock, const byte *xorBlock, byte *outBloc
 }
 #endif
 
+//运行时根据CPU 能力返回一个字符串，告诉上层 “我这次 AES 到底用的哪套实现”，
 std::string Rijndael::Base::AlgorithmProvider() const
 {
 #if (CRYPTOPP_AESNI_AVAILABLE)
@@ -393,6 +347,9 @@ std::string Rijndael::Base::AlgorithmProvider() const
 	return "C++";
 }
 
+//Crypto++ AES 密钥扩展的“总调度中心”——运行时根据 CPU 能力选择最快路径，
+//回退顺序：
+//Cryptogams ARMv7 → AES-NI → Power8 → 纯 C++，并为解密预计算“逆轮密钥”，
 void Rijndael::Base::UncheckedSetKey(const byte *userKey, unsigned int keyLen, const NameValuePairs &)
 {
 	AssertValidKeyLength(keyLen);
@@ -403,7 +360,7 @@ void Rijndael::Base::UncheckedSetKey(const byte *userKey, unsigned int keyLen, c
 		m_rounds = keyLen/4 + 6;
 		m_key.New(4*(14+1)+4);
 
-		if (IsForwardTransformation())
+		if (IsForwardTransformation()) //判断加解密
 			CRYPTOGAMS_set_encrypt_key(userKey, keyLen*8, m_key.begin());
 		else
 			CRYPTOGAMS_set_decrypt_key(userKey, keyLen*8, m_key.begin());
@@ -439,7 +396,7 @@ void Rijndael::Base::UncheckedSetKey(const byte *userKey, unsigned int keyLen, c
 #if CRYPTOPP_POWER8_AES_AVAILABLE
 	if (HasAES())
 	{
-		// We still need rcon and Se to fallback to C/C++ for AES-192 and AES-256.
+		// Power8 只支持 128-bit 密钥 → 192/256 用 C++ 补
 		// The IBM docs on AES sucks. Intel's docs on AESNI puts IBM to shame.
 		Rijndael_UncheckedSetKey_POWER8(userKey, keyLen, rk, Se);
 		return;
@@ -528,6 +485,10 @@ void Rijndael::Base::UncheckedSetKey(const byte *userKey, unsigned int keyLen, c
 #endif
 }
 
+//Crypto++ AES 加密单块入口的“终极调度器”——运行时按CPU 能力降序选择路径：
+// SSE2/x64 手汇 → AES-NI → ARMv8 → Cryptogams ARMv7 → Power8 → 纯 C++
+//纯 C++ 路径内嵌防时序攻击预加载 + 宏展开轮函数，
+//一次调用完成 16 字节加密 + 可选 XOR。
 void Rijndael::Enc::ProcessAndXorBlock(const byte *inBlock, const byte *xorBlock, byte *outBlock) const
 {
 #if CRYPTOPP_SSE2_ASM_AVAILABLE || defined(CRYPTOPP_X64_MASM_AVAILABLE) || CRYPTOPP_AESNI_AVAILABLE
@@ -571,6 +532,7 @@ void Rijndael::Enc::ProcessAndXorBlock(const byte *inBlock, const byte *xorBlock
 	word32 s0, s1, s2, s3, t0, t1, t2, t3;
 	Block::Get(inBlock)(s0)(s1)(s2)(s3);
 
+	//首轮密钥加
 	const word32 *rk = m_key;
 	s0 ^= rk[0];
 	s1 ^= rk[1];
@@ -634,6 +596,11 @@ void Rijndael::Enc::ProcessAndXorBlock(const byte *inBlock, const byte *xorBlock
 	Block::Put(xorBlock, outBlock)(tbw[0]^rk[0])(tbw[1]^rk[1])(tbw[2]^rk[2])(tbw[3]^rk[3]);
 }
 
+//Crypto++ AES 解密的单块“终极调度器”——硬件路径优先
+//（AES-NI → ARMv8 → Cryptogams → Power8），
+//回退纯 C++ 时 用 Td[] 逆表 + 逆轮密钥顺序 + 同样防时序预加载，
+//宏展开完成 10 轮逆变换，最后一轮无 MC，
+//输出前可选 XOR（CTR/XTS 模式）。
 void Rijndael::Dec::ProcessAndXorBlock(const byte *inBlock, const byte *xorBlock, byte *outBlock) const
 {
 #if CRYPTOPP_AESNI_AVAILABLE
@@ -1331,3 +1298,4 @@ NAMESPACE_END
 
 #endif
 #endif
+
